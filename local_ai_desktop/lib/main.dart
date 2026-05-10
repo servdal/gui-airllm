@@ -17,7 +17,9 @@ const _muted = Color(0xFF5C6A72);
 const _soft = Color(0xFFEAF4F1);
 
 class LocalAiDesktopApp extends StatelessWidget {
-  const LocalAiDesktopApp({super.key});
+  const LocalAiDesktopApp({super.key, this.enableSystemStats = true});
+
+  final bool enableSystemStats;
 
   @override
   Widget build(BuildContext context) {
@@ -36,7 +38,7 @@ class LocalAiDesktopApp extends StatelessWidget {
           bodyLarge: TextStyle(color: _text, height: 1.35, fontSize: 13),
         ),
       ),
-      home: const LocalAiHome(),
+      home: LocalAiHome(enableSystemStats: enableSystemStats),
     );
   }
 }
@@ -100,7 +102,9 @@ class ChatSession {
 }
 
 class LocalAiHome extends StatefulWidget {
-  const LocalAiHome({super.key});
+  const LocalAiHome({super.key, this.enableSystemStats = true});
+
+  final bool enableSystemStats;
 
   @override
   State<LocalAiHome> createState() => _LocalAiHomeState();
@@ -129,6 +133,7 @@ class _LocalAiHomeState extends State<LocalAiHome> with WidgetsBindingObserver {
 
   Process? _serverProcess;
   Process? _downloadProcess;
+  Timer? _systemStatsTimer;
   String? _activeSessionId;
   var _selectedPage = 0;
   var _serverRunning = false;
@@ -138,6 +143,9 @@ class _LocalAiHomeState extends State<LocalAiHome> with WidgetsBindingObserver {
   var _gitBusy = false;
   var _showPythonProcessLog = false;
   var _gitOutput = 'Git output akan muncul di sini.';
+  var _cpuUsage = '...';
+  var _memoryUsage = '...';
+  var _cpuTemp = 'N/A';
   var _maxNewTokens = 700.0;
   var _maxLength = 2048.0;
   final _port = 7860;
@@ -159,12 +167,20 @@ class _LocalAiHomeState extends State<LocalAiHome> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     unawaited(_loadChatHistory());
+    if (widget.enableSystemStats) {
+      unawaited(_refreshSystemStats());
+      _systemStatsTimer = Timer.periodic(
+        const Duration(seconds: 5),
+        (_) => unawaited(_refreshSystemStats()),
+      );
+    }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _terminatePythonProcesses();
+    _systemStatsTimer?.cancel();
     _appFolderController.dispose();
     _workspaceController.dispose();
     _activeModelController.dispose();
@@ -223,6 +239,87 @@ class _LocalAiHomeState extends State<LocalAiHome> with WidgetsBindingObserver {
         );
       }
     });
+  }
+
+  Future<void> _refreshSystemStats() async {
+    final results = await Future.wait<String>([
+      _readCpuUsage(),
+      _readMemoryUsage(),
+      _readCpuTemperature(),
+    ]);
+    if (!mounted) return;
+    setState(() {
+      _cpuUsage = results[0];
+      _memoryUsage = results[1];
+      _cpuTemp = results[2];
+    });
+  }
+
+  Future<String> _readCpuUsage() async {
+    try {
+      final result = await Process.run('top', [
+        '-l',
+        '1',
+        '-n',
+        '0',
+        '-s',
+        '0',
+      ]);
+      final output = '${result.stdout}\n${result.stderr}';
+      final match = RegExp(r'CPU usage:.*?([\d.]+)% idle').firstMatch(output);
+      if (match == null) return 'N/A';
+      final idle = double.tryParse(match.group(1) ?? '');
+      if (idle == null) return 'N/A';
+      return '${(100 - idle).clamp(0, 100).toStringAsFixed(0)}%';
+    } catch (_) {
+      return 'N/A';
+    }
+  }
+
+  Future<String> _readMemoryUsage() async {
+    try {
+      final totalResult = await Process.run('sysctl', ['-n', 'hw.memsize']);
+      final totalBytes = int.tryParse(totalResult.stdout.toString().trim());
+      if (totalBytes == null || totalBytes <= 0) return 'N/A';
+
+      final vmResult = await Process.run('vm_stat', []);
+      final output = vmResult.stdout.toString();
+      final pageSizeMatch = RegExp(
+        r'page size of (\d+) bytes',
+      ).firstMatch(output);
+      final pageSize = int.tryParse(pageSizeMatch?.group(1) ?? '') ?? 4096;
+      int pagesFor(String label) {
+        final match = RegExp('$label:\\s+(\\d+)\\.').firstMatch(output);
+        return int.tryParse(match?.group(1) ?? '') ?? 0;
+      }
+
+      final active = pagesFor('Pages active');
+      final wired = pagesFor('Pages wired down');
+      final compressed = pagesFor('Pages occupied by compressor');
+      final usedBytes = (active + wired + compressed) * pageSize;
+      final percent = (usedBytes / totalBytes * 100).clamp(0, 100);
+      return '${percent.toStringAsFixed(0)}%';
+    } catch (_) {
+      return 'N/A';
+    }
+  }
+
+  Future<String> _readCpuTemperature() async {
+    for (final command in const [
+      'osx-cpu-temp',
+      '/opt/homebrew/bin/osx-cpu-temp',
+      '/usr/local/bin/osx-cpu-temp',
+    ]) {
+      try {
+        final result = await Process.run(command, []);
+        if (result.exitCode != 0) continue;
+        final output = result.stdout.toString().trim();
+        if (output.isNotEmpty) return output.replaceAll('°', '');
+      } catch (_) {
+        continue;
+      }
+    }
+    return 'N/A';
   }
 
   Future<void> _loadChatHistory() async {
@@ -537,6 +634,9 @@ class _LocalAiHomeState extends State<LocalAiHome> with WidgetsBindingObserver {
         if (paths.isNotEmpty) {
           answer = '$answer\n\nFile ditulis ke working folder:\n- $paths';
         }
+      } else if (response.statusCode == 200 &&
+          _looksLikeFileEditPrompt(prompt)) {
+        answer = '$answer\n\nTidak ada file yang berubah.';
       }
       setState(() {
         _messages.add(ChatMessage('assistant', answer));
@@ -692,6 +792,9 @@ print(path)
             selected: _selectedPage,
             onSelected: (value) => setState(() => _selectedPage = value),
             serverRunning: _serverRunning,
+            cpuUsage: _cpuUsage,
+            memoryUsage: _memoryUsage,
+            cpuTemp: _cpuTemp,
             workspaceController: _workspaceController,
             onPickFolder: _chooseWorkspaceFolder,
             sessions: _sessions,
@@ -1206,6 +1309,9 @@ class _LeftSidebar extends StatelessWidget {
     required this.selected,
     required this.onSelected,
     required this.serverRunning,
+    required this.cpuUsage,
+    required this.memoryUsage,
+    required this.cpuTemp,
     required this.workspaceController,
     required this.onPickFolder,
     required this.sessions,
@@ -1218,6 +1324,9 @@ class _LeftSidebar extends StatelessWidget {
   final int selected;
   final ValueChanged<int> onSelected;
   final bool serverRunning;
+  final String cpuUsage;
+  final String memoryUsage;
+  final String cpuTemp;
   final TextEditingController workspaceController;
   final VoidCallback onPickFolder;
   final List<ChatSession> sessions;
@@ -1295,6 +1404,15 @@ class _LeftSidebar extends StatelessWidget {
                     ),
                   ),
                 ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: _SystemStatsMini(
+                cpuUsage: cpuUsage,
+                memoryUsage: memoryUsage,
+                cpuTemp: cpuTemp,
               ),
             ),
             const SizedBox(height: 12),
@@ -1488,6 +1606,99 @@ class _HistoryTile extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _SystemStatsMini extends StatelessWidget {
+  const _SystemStatsMini({
+    required this.cpuUsage,
+    required this.memoryUsage,
+    required this.cpuTemp,
+  });
+
+  final String cpuUsage;
+  final String memoryUsage;
+  final String cpuTemp;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFC),
+        border: Border.all(color: _line),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: _MiniStat(
+              label: 'CPU',
+              value: cpuUsage,
+              icon: Icons.speed_rounded,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: _MiniStat(
+              label: 'Memory',
+              value: memoryUsage,
+              icon: Icons.memory_rounded,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: _MiniStat(
+              label: 'Temp',
+              value: cpuTemp,
+              icon: Icons.thermostat_rounded,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MiniStat extends StatelessWidget {
+  const _MiniStat({
+    required this.label,
+    required this.value,
+    required this.icon,
+  });
+
+  final String label;
+  final String value;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: '$label: $value',
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 15, color: _accent),
+          const SizedBox(height: 3),
+          Text(
+            value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.w800,
+              color: _text,
+            ),
+          ),
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 9, color: _muted),
+          ),
+        ],
       ),
     );
   }
@@ -1793,6 +2004,25 @@ bool _looksLikeCode(String value) {
       value.contains('import ') ||
       value.contains('=>') ||
       value.contains('{') && value.contains(';');
+}
+
+bool _looksLikeFileEditPrompt(String value) {
+  final lowered = value.toLowerCase();
+  final hasAction = [
+    'edit',
+    'ubah',
+    'update',
+    'perbaiki',
+    'tambahkan',
+    'hapus',
+    'buat',
+    'buatkan',
+  ].any(lowered.contains);
+  final hasFilePath = RegExp(
+    r'[\w./@+-]+\.(md|txt|html|css|js|ts|tsx|dart|py|php|json|ya?ml|sql|swift)',
+    caseSensitive: false,
+  ).hasMatch(value);
+  return hasAction && hasFilePath;
 }
 
 List<ChatMessage> _initialMessages() {

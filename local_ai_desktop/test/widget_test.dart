@@ -3,7 +3,7 @@ import 'package:local_ai_desktop/main.dart';
 
 void main() {
   testWidgets('renders local coding app shell', (tester) async {
-    await tester.pumpWidget(const LocalAiDesktopApp());
+    await tester.pumpWidget(const LocalAiDesktopApp(enableSystemStats: false));
 
     expect(find.text('Coding Assistant'), findsOneWidget);
     expect(find.text('Git Actions'), findsOneWidget);
