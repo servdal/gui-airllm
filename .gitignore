@@ -5,3 +5,6 @@ airllm.egg-info
 build
 dist
 __pycache__
+.venv/
+.flutter_home/
+models/
