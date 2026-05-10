@@ -72,6 +72,23 @@ TEXT_EXTENSIONS = {
     ".yaml",
     ".yml",
 }
+FILE_ACTION_WORDS = (
+    "buat",
+    "buatkan",
+    "create",
+    "edit",
+    "ubah",
+    "update",
+    "tambahkan",
+    "hapus",
+    "perbaiki",
+    "tulis",
+    "write",
+)
+FILE_PATH_PATTERN = re.compile(
+    r"(?P<path>[\w./@+-]+\.(?:md|txt|html|css|js|ts|tsx|dart|py|php|json|ya?ml|sql|swift))",
+    re.IGNORECASE,
+)
 
 
 class ModelState:
@@ -155,10 +172,12 @@ def build_coding_prompt(user_prompt: str, workspace: Path | None) -> str:
 Aturan penting:
 - Jawab dalam bahasa Indonesia.
 - Gunakan konteks folder kerja di bawah untuk memahami proyek.
-- Jika user meminta membuat atau mengubah file, berikan file lengkap dalam blok:
+- Jika user meminta membuat atau mengubah file, WAJIB berikan isi file lengkap dalam blok ini:
 ```file:path/relative/ke/workspace.ext
 isi file lengkap
 ```
+- Untuk permintaan edit/create file, jangan hanya menjelaskan rencana. Tulis file dengan blok `file:` agar aplikasi dapat menyimpan perubahan.
+- Jika user hanya menyebut "edit <nama_file>" tanpa menjelaskan perubahan apa yang diinginkan, tanyakan perubahan yang dimaksud dan jangan membuat blok file.
 - Path file harus relatif terhadap working folder.
 - Jangan menulis file di luar working folder.
 
@@ -168,6 +187,33 @@ KONTEKS FOLDER:
 PERMINTAAN USER:
 {user_prompt}
 """
+
+
+def has_file_change_intent(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return any(word in lowered for word in FILE_ACTION_WORDS) and bool(FILE_PATH_PATTERN.search(prompt))
+
+
+def is_vague_file_edit_request(prompt: str) -> bool:
+    normalized = prompt.strip()
+    return bool(
+        re.fullmatch(
+            r"(edit|ubah|update|perbaiki)\s+(file\s+)?[\w./@+-]+\.(?:md|txt|html|css|js|ts|tsx|dart|py|php|json|ya?ml|sql|swift)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def missing_file_block_message(prompt: str) -> str:
+    path_match = FILE_PATH_PATTERN.search(prompt)
+    target = path_match.group("path") if path_match else "file target"
+    return (
+        "Saya belum mengubah file karena jawaban model tidak menghasilkan blok penulisan file. "
+        f"Untuk mengubah {target}, tulis instruksi yang lebih spesifik, misalnya: "
+        f"`edit {target}: tambahkan bagian cara instalasi` atau "
+        f"`ubah {target}: ganti judul menjadi ...`."
+    )
 
 
 def extract_file_blocks(answer: str, workspace: Path | None) -> list[dict[str, str]]:
@@ -733,6 +779,8 @@ def parse_options(raw: dict[str, Any]) -> dict[str, Any]:
     return {
         "prompt": build_coding_prompt(prompt, workspace),
         "original_prompt": prompt,
+        "has_file_change_intent": has_file_change_intent(prompt),
+        "is_vague_file_edit_request": is_vague_file_edit_request(prompt),
         "workspace": workspace,
         "workspace_path": str(workspace) if workspace else "",
         "model_id": model_id,
@@ -772,9 +820,27 @@ class AirLLMHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw_body or "{}")
             process_log("Request /ask diterima.")
             options = parse_options(payload)
-            answer = generate_answer(options)
-            process_log("Mengecek blok file pada jawaban.")
-            files_written = extract_file_blocks(answer, options["workspace"])
+            if options["is_vague_file_edit_request"]:
+                answer = missing_file_block_message(options["original_prompt"])
+                files_written = []
+                process_log("Permintaan edit file belum spesifik; file tidak ditulis.")
+            else:
+                answer = generate_answer(options)
+                process_log("Mengecek blok file pada jawaban.")
+                files_written = extract_file_blocks(answer, options["workspace"])
+                if options["has_file_change_intent"] and not files_written:
+                    process_log("Jawaban tidak berisi blok file; meminta model mengulang format tulis file.")
+                    retry_options = dict(options)
+                    retry_options["prompt"] = (
+                        options["prompt"]
+                        + "\n\nJawaban sebelumnya tidak memakai blok `file:` sehingga aplikasi tidak bisa menulis file. "
+                        + "Ulangi jawaban. Jika perubahan file sudah jelas, keluarkan file lengkap hanya dengan format "
+                        + "```file:path/relative\nisi file\n```. Jika instruksi belum jelas, tanyakan detail perubahan."
+                    )
+                    answer = generate_answer(retry_options)
+                    files_written = extract_file_blocks(answer, options["workspace"])
+                if options["has_file_change_intent"] and not files_written:
+                    answer = f"{answer}\n\n{missing_file_block_message(options['original_prompt'])}"
             if files_written:
                 process_log(f"{len(files_written)} file ditulis ke working folder.")
             process_log("Menyimpan riwayat chat ke MySQL jika tersedia.")
