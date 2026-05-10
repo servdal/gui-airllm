@@ -8,3 +8,4 @@ __pycache__
 .venv/
 .flutter_home/
 models/
+.local_ai_desktop_chat_history.json

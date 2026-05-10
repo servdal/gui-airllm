@@ -12,7 +12,10 @@ Then open:
 from __future__ import annotations
 
 import json
+import os
 import platform
+import re
+import subprocess
 import sys
 import traceback
 from html import escape
@@ -33,6 +36,42 @@ if str(LOCAL_PACKAGE) not in sys.path:
 DEFAULT_MODEL = str(ROOT / "models" / "Qwen2.5-Coder-7B-Instruct-4bit")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7860
+DEFAULT_DB = {
+    "host": os.environ.get("DB_HOST", "127.0.0.1"),
+    "port": int(os.environ.get("DB_PORT", "3306")),
+    "database": os.environ.get("DB_DATABASE", "db_ailokal"),
+    "username": os.environ.get("DB_USERNAME", "duidev"),
+    "password": os.environ.get("DB_PASSWORD", "bismillah"),
+}
+SKIP_DIRS = {
+    ".git",
+    ".dart_tool",
+    ".idea",
+    ".venv",
+    "__pycache__",
+    "build",
+    "DerivedData",
+    "node_modules",
+    "vendor",
+}
+TEXT_EXTENSIONS = {
+    ".css",
+    ".dart",
+    ".env",
+    ".html",
+    ".js",
+    ".json",
+    ".md",
+    ".php",
+    ".py",
+    ".sql",
+    ".swift",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
 
 
 class ModelState:
@@ -43,6 +82,160 @@ class ModelState:
 
 
 STATE = ModelState()
+
+
+def process_log(message: str) -> None:
+    print(f"[process] {message}", flush=True)
+
+
+def resolve_workspace(value: str) -> Path | None:
+    if not value.strip():
+        return None
+    path = Path(value).expanduser().resolve()
+    if not path.exists() or not path.is_dir():
+        raise ValueError("Working folder tidak ditemukan.")
+    return path
+
+
+def is_inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def is_text_file(path: Path) -> bool:
+    if path.name in {"pubspec.yaml", "package.json", "composer.json"}:
+        return True
+    return path.suffix.lower() in TEXT_EXTENSIONS
+
+
+def workspace_snapshot(workspace: Path | None) -> str:
+    if workspace is None:
+        return "Working folder belum dipilih."
+
+    entries: list[str] = []
+    snippets: list[str] = []
+    file_count = 0
+    snippet_count = 0
+
+    for path in sorted(workspace.rglob("*")):
+        rel = path.relative_to(workspace)
+        if any(part in SKIP_DIRS for part in rel.parts):
+            continue
+        if len(entries) < 180:
+            marker = "/" if path.is_dir() else ""
+            entries.append(f"- {rel}{marker}")
+        if path.is_file():
+            file_count += 1
+            if snippet_count < 24 and is_text_file(path) and path.stat().st_size <= 80_000:
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                snippets.append(
+                    f"\n--- FILE: {rel} ---\n{text[:1800].rstrip()}"
+                )
+                snippet_count += 1
+
+    tree = "\n".join(entries) if entries else "(folder kosong)"
+    suffix = "" if len(entries) < 180 else "\n- ... daftar dipotong"
+    return (
+        f"WORKSPACE: {workspace}\n"
+        f"TOTAL FILE: {file_count}\n"
+        f"DAFTAR FILE:\n{tree}{suffix}\n"
+        f"ISI FILE TERPILIH:{''.join(snippets) if snippets else ' Tidak ada file teks kecil.'}"
+    )
+
+
+def build_coding_prompt(user_prompt: str, workspace: Path | None) -> str:
+    return f"""Kamu adalah asisten coding lokal yang bekerja pada folder proyek user.
+
+Aturan penting:
+- Jawab dalam bahasa Indonesia.
+- Gunakan konteks folder kerja di bawah untuk memahami proyek.
+- Jika user meminta membuat atau mengubah file, berikan file lengkap dalam blok:
+```file:path/relative/ke/workspace.ext
+isi file lengkap
+```
+- Path file harus relatif terhadap working folder.
+- Jangan menulis file di luar working folder.
+
+KONTEKS FOLDER:
+{workspace_snapshot(workspace)}
+
+PERMINTAAN USER:
+{user_prompt}
+"""
+
+
+def extract_file_blocks(answer: str, workspace: Path | None) -> list[dict[str, str]]:
+    if workspace is None:
+        return []
+
+    workspace = workspace.resolve()
+    pattern = re.compile(r"```file:([^\n\r`]+)\r?\n(.*?)```", re.DOTALL)
+    written: list[dict[str, str]] = []
+    for match in pattern.finditer(answer):
+        relative = match.group(1).strip().lstrip("/\\")
+        content = match.group(2)
+        target = (workspace / relative).resolve()
+        if not is_inside(target, workspace):
+            raise ValueError(f"Path file di luar working folder ditolak: {relative}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        written.append({"path": str(target.relative_to(workspace)), "bytes": str(len(content.encode("utf-8")))})
+    return written
+
+
+def sql_escape(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return "'" + text.replace("\\", "\\\\").replace("'", "\\'").replace("\0", "") + "'"
+
+
+def save_history(options: dict[str, Any], answer: str, files_written: list[dict[str, str]]) -> None:
+    sql = f"""
+CREATE TABLE IF NOT EXISTS local_ai_chat_history (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  workspace_path TEXT NULL,
+  prompt MEDIUMTEXT NOT NULL,
+  answer MEDIUMTEXT NOT NULL,
+  files_written JSON NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+INSERT INTO local_ai_chat_history (workspace_path, prompt, answer, files_written)
+VALUES (
+  {sql_escape(options.get("workspace_path", ""))},
+  {sql_escape(options.get("original_prompt", options.get("prompt", "")))},
+  {sql_escape(answer)},
+  {sql_escape(json.dumps(files_written, ensure_ascii=False))}
+);
+"""
+    command = [
+        "mysql",
+        "-h",
+        DEFAULT_DB["host"],
+        "-P",
+        str(DEFAULT_DB["port"]),
+        "-u",
+        DEFAULT_DB["username"],
+        DEFAULT_DB["database"],
+    ]
+    env = {**os.environ, "MYSQL_PWD": DEFAULT_DB["password"]}
+    try:
+        subprocess.run(
+            command,
+            input=sql,
+            text=True,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        pass
 
 
 HTML = """
@@ -393,6 +586,7 @@ def load_airllm_model(options: dict[str, Any]):
     from airllm import AutoModel
 
     model_id = options["model_id"]
+    process_log(f"Memuat model AirLLM: {model_id}")
     kwargs: dict[str, Any] = {
         "delete_original": options["delete_original"],
     }
@@ -426,6 +620,7 @@ def load_mlx_lm_model(options: dict[str, Any]):
     from mlx_lm import load
 
     model_id = options["model_id"]
+    process_log(f"Memuat model MLX-LM: {model_id}")
     cache_key = (
         "mlx_lm",
         model_id,
@@ -445,15 +640,18 @@ def generate_answer(options: dict[str, Any]) -> str:
     if options["backend"] == "mlx_lm":
         from mlx_lm import generate
 
+        process_log("Menyiapkan tokenizer dan model MLX-LM.")
         model, tokenizer = load_mlx_lm_model(options)
         prompt = options["prompt"]
         if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+            process_log("Menerapkan chat template model.")
             prompt = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 tokenize=False,
                 add_generation_prompt=True,
             )
 
+        process_log("Mulai generate jawaban.")
         return generate(
             model,
             tokenizer,
@@ -463,6 +661,7 @@ def generate_answer(options: dict[str, Any]) -> str:
         )
 
     model = load_airllm_model(options)
+    process_log("Mulai generate jawaban AirLLM.")
     prompt = options["prompt"]
     max_length = options["max_length"]
     max_new_tokens = options["max_new_tokens"]
@@ -519,6 +718,10 @@ def parse_options(raw: dict[str, Any]) -> dict[str, Any]:
     model_id = str(raw.get("model_id", "")).strip() or DEFAULT_MODEL
     compression = str(raw.get("compression", "")).strip()
     backend = str(raw.get("backend", "mlx_lm")).strip()
+    workspace_path = str(raw.get("workspace_path", "")).strip()
+    workspace = resolve_workspace(workspace_path) if workspace_path else None
+    if workspace:
+        process_log(f"Membaca konteks working folder: {workspace}")
 
     if not prompt:
         raise ValueError("Pertanyaan masih kosong.")
@@ -528,7 +731,10 @@ def parse_options(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Backend tidak valid.")
 
     return {
-        "prompt": prompt,
+        "prompt": build_coding_prompt(prompt, workspace),
+        "original_prompt": prompt,
+        "workspace": workspace,
+        "workspace_path": str(workspace) if workspace else "",
         "model_id": model_id,
         "backend": backend,
         "max_length": max(8, min(int(raw.get("max_length") or 256), 8192)),
@@ -564,9 +770,21 @@ class AirLLMHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             raw_body = self.rfile.read(length).decode("utf-8")
             payload = json.loads(raw_body or "{}")
+            process_log("Request /ask diterima.")
             options = parse_options(payload)
             answer = generate_answer(options)
-            json_response(self, HTTPStatus.OK, {"answer": answer})
+            process_log("Mengecek blok file pada jawaban.")
+            files_written = extract_file_blocks(answer, options["workspace"])
+            if files_written:
+                process_log(f"{len(files_written)} file ditulis ke working folder.")
+            process_log("Menyimpan riwayat chat ke MySQL jika tersedia.")
+            save_history(options, answer, files_written)
+            process_log("Request selesai.")
+            json_response(
+                self,
+                HTTPStatus.OK,
+                {"answer": answer, "files_written": files_written},
+            )
         except Exception as exc:
             traceback.print_exc()
             json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
